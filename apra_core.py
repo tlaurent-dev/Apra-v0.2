@@ -104,7 +104,6 @@ def analyze_project(csv_path, today=None):
     graph = build_dependency_graph(df)
     propagated = propagate_risk(df, graph)
 
-    # ✅ THIS IS THE LINE THAT WAS BROKEN BEFORE
     df["Propagated Risk %"] = df["Task"].map(propagated)
 
     critical_path = find_critical_path(df, graph)
@@ -114,7 +113,7 @@ def analyze_project(csv_path, today=None):
 
 
 # ======================================================
-# Monte Carlo simulation
+# Monte Carlo helpers
 # ======================================================
 
 def topo_order(graph):
@@ -139,7 +138,10 @@ def topo_order(graph):
 
 
 def sample_task_duration(base_days, risk_pct):
-    r = risk_pct / 100.0
+    """
+    Original risk-driven sampling (fallback when no PERT).
+    """
+    r = max(0.0, min(risk_pct / 100.0, 1.0))
     roll = random.random()
 
     if roll < 1 - r:
@@ -154,9 +156,62 @@ def sample_task_duration(base_days, risk_pct):
     return base_days * factor
 
 
+def _to_float_or_none(x):
+    try:
+        if pd.isna(x):
+            return None
+        s = str(x).strip()
+        if s == "":
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+
+def pert_sample(o, m, p):
+    """
+    PERT sampling via Beta distribution, bounded to [o, p].
+    Assumes o <= m <= p.
+    """
+    import random
+
+    if o is None or m is None or p is None:
+        return None
+    if not (o <= m <= p):
+        return None
+    if p == o:
+        return float(m)
+
+    alpha = 1.0 + 4.0 * (m - o) / (p - o)
+    beta = 1.0 + 4.0 * (p - m) / (p - o)
+
+    u = random.betavariate(alpha, beta)
+    return o + u * (p - o)
+
+
+def task_duration_for_mc(row, base_duration_days, risk_pct):
+    """
+    If Optimistic/MostLikely/Pessimistic are present and valid -> sample PERT duration.
+    Else fallback to original risk-driven sampling.
+    """
+    o = _to_float_or_none(row.get("Optimistic"))
+    m = _to_float_or_none(row.get("MostLikely"))
+    p = _to_float_or_none(row.get("Pessimistic"))
+
+    sampled = pert_sample(o, m, p)
+    if sampled is not None:
+        # modest stretch based on risk so risk signal still matters
+        r = max(0.0, min(risk_pct / 100.0, 1.0))
+        stretch = 1.0 + 0.30 * r
+        return max(0.5, sampled * stretch)
+
+    return sample_task_duration(base_duration_days, risk_pct)
+
+
 def monte_carlo_project_duration(df, graph, sims=5000, use_propagated=True, seed=42):
     random.seed(seed)
 
+    # Base durations from Start/Due (days)
     durations = {}
     for _, r in df.iterrows():
         start = pd.to_datetime(r["Start"])
@@ -169,16 +224,33 @@ def monte_carlo_project_duration(df, graph, sims=5000, use_propagated=True, seed
     order = topo_order(graph)
     samples = []
 
+    # Planned duration for reporting:
+    # - If PERT exists & valid, use mean (o+4m+p)/6
+    # - Else use Start/Due duration
+    planned = 0.0
+    for _, r in df.iterrows():
+        o = _to_float_or_none(r.get("Optimistic"))
+        m = _to_float_or_none(r.get("MostLikely"))
+        p = _to_float_or_none(r.get("Pessimistic"))
+        if o is not None and m is not None and p is not None and (o <= m <= p):
+            planned += (o + 4 * m + p) / 6.0
+        else:
+            planned += durations[r["Task"]]
+
     for _ in range(sims):
         finish = {}
         for t in order:
             deps = graph.get(t, [])
-            start_time = max([finish.get(d, 0) for d in deps], default=0)
-            dur = sample_task_duration(durations[t], risk_map.get(t, 0))
-            finish[t] = start_time + dur
-        samples.append(max(finish.values()))
+            start_time = max([finish.get(d, 0.0) for d in deps], default=0.0)
 
-    return sum(durations.values()), samples
+            row = df.loc[df["Task"] == t].iloc[0]
+            dur = task_duration_for_mc(row, durations[t], risk_map.get(t, 0.0))
+
+            finish[t] = start_time + dur
+
+        samples.append(max(finish.values()) if finish else 0.0)
+
+    return planned, samples
 
 
 def summarize_samples(planned, samples):

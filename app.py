@@ -22,7 +22,10 @@ def analyze_project_from_df(df_in, today):
     try:
         return analyze_project(path, today=today)
     finally:
-        os.remove(path)
+        try:
+            os.remove(path)
+        except Exception:
+            pass
 
 
 def validate_csv(df):
@@ -31,6 +34,37 @@ def validate_csv(df):
     if missing:
         st.error(f"Missing required columns: {', '.join(missing)}")
         st.stop()
+
+    # Optional PERT validation (only if any PERT column exists)
+    pert_cols = ["Optimistic", "MostLikely", "Pessimistic"]
+    has_any_pert = any(c in df.columns for c in pert_cols)
+
+    if has_any_pert:
+        for c in pert_cols:
+            if c not in df.columns:
+                st.error(f"If you use PERT, your CSV must include all three columns: {', '.join(pert_cols)}")
+                st.stop()
+
+        bad_rows = []
+        for i, r in df.iterrows():
+            vals = [r.get("Optimistic"), r.get("MostLikely"), r.get("Pessimistic")]
+            # If row doesn't use PERT, skip
+            if all(pd.isna(v) or str(v).strip() == "" for v in vals):
+                continue
+            try:
+                o = float(r["Optimistic"])
+                m = float(r["MostLikely"])
+                p = float(r["Pessimistic"])
+                if not (o <= m <= p):
+                    bad_rows.append((i + 2, r["Task"], "Must satisfy Optimistic <= MostLikely <= Pessimistic"))
+            except Exception:
+                bad_rows.append((i + 2, r["Task"], "PERT values must be numeric"))
+
+        if bad_rows:
+            msg = "Invalid PERT rows found (CSV row numbers shown):\n\n"
+            msg += "\n".join([f"- Row {rn} ({task}): {reason}" for rn, task, reason in bad_rows[:15]])
+            st.error(msg)
+            st.stop()
 
 
 # =========================
@@ -43,16 +77,20 @@ st.title("APRA — Project Risk Dashboard")
 with st.sidebar:
     uploaded = st.file_uploader("Upload tasks CSV", type=["csv"])
     use_demo = st.checkbox("Use demo data", value=False)
-    sims = st.slider("Monte Carlo simulations", 500, 20000, 5000, step=500)
+    sims = st.slider("Monte Carlo simulations", 500, 20000, 1000, step=500)  # safer default for cloud
     today = st.date_input("Today", value=date.today())
 
-    with open("sample_tasks.csv", "rb") as f:
-        st.download_button(
-            "Download sample CSV",
-            f,
-            file_name="sample_tasks.csv",
-            mime="text/csv",
-        )
+    # Sample download
+    try:
+        with open("sample_tasks.csv", "rb") as f:
+            st.download_button(
+                "Download sample CSV",
+                f,
+                file_name="sample_tasks.csv",
+                mime="text/csv",
+            )
+    except FileNotFoundError:
+        st.caption("sample_tasks.csv not found in repo (optional).")
 
 # =========================
 # Data load (single path)
@@ -68,12 +106,21 @@ else:
 
 validate_csv(df_in)
 
+# PERT detection banner
+if all(c in df_in.columns for c in ["Optimistic", "MostLikely", "Pessimistic"]):
+    st.success("PERT enabled: Monte Carlo will use Optimistic/MostLikely/Pessimistic where provided.")
+else:
+    st.info("PERT not detected. Monte Carlo uses Start/Due durations + risk model.")
+
 # =========================
 # Analysis
 # =========================
 
 df, critical_path, graph = analyze_project_from_df(df_in, today)
-planned, samples = monte_carlo_project_duration(df, graph, sims=sims)
+
+with st.spinner("Running Monte Carlo..."):
+    planned, samples = monte_carlo_project_duration(df, graph, sims=sims)
+
 summary = summarize_samples(planned, samples)
 
 # =========================
@@ -88,20 +135,14 @@ c4.metric("Delay %", summary["delay_probability_pct"])
 
 st.markdown(f"**Critical Path:** {' → '.join(critical_path)}")
 
-st.dataframe(
-    df[
-        [
-            "Task",
-            "Start",
-            "Due",
-            "Progress",
-            "Base Risk %",
-            "Propagated Risk %",
-            "On Critical Path",
-        ]
-    ],
-    use_container_width=True,
-)
+# Dynamic table (show PERT cols if present)
+pert_cols = ["Optimistic", "MostLikely", "Pessimistic"]
+if all(c in df_in.columns for c in pert_cols):
+    display_cols = ["Task", "Start", "Due", "Progress"] + pert_cols + ["Base Risk %", "Propagated Risk %", "On Critical Path"]
+else:
+    display_cols = ["Task", "Start", "Due", "Progress", "Base Risk %", "Propagated Risk %", "On Critical Path"]
+
+st.dataframe(df[display_cols], use_container_width=True)
 
 left, right = st.columns(2)
 with left:

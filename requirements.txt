@@ -1,0 +1,4 @@
+matplotlib==3.10.3  
+pandas==2.2.1 
+reportlab==3.6.13  
+streamlit==1.52.1  
